@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pinpt/go-common/log"
@@ -17,11 +19,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const maxAttempts = time.Second * 10
-
-var skipHeaders = map[string]bool{
-	"Content-Length": true,
-}
+const maxRetryDuration = time.Second * 10
 
 func newClient() *http.Client {
 	client := &http.Client{}
@@ -32,11 +30,12 @@ func newClient() *http.Client {
 			KeepAlive: 30 * time.Second,
 			DualStack: true,
 		}).DialContext,
-		ForceAttemptHTTP2:     true,
+		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		DisableKeepAlives:     true, // since we reuse on each call
 		DisableCompression:    true, // disable so we can stream byte-for-byte
 	}
 	return client
@@ -76,18 +75,22 @@ var rootCmd = &cobra.Command{
 			var tx int64
 			rx := len(body)
 			var retries int
-			for time.Since(started) < maxAttempts {
+			for time.Since(started) < maxRetryDuration {
 				newreq, _ := http.NewRequestWithContext(req.Context(), req.Method, u.String(), bytes.NewReader(body))
 				for k, v := range req.Header {
-					if !skipHeaders[k] {
-						newreq.Header.Set(k, v[0])
-					}
+					newreq.Header.Set(k, v[0])
 				}
+				newreq.Header.Set("Content-Length", strconv.Itoa(len(body)))
 				cl := newClient() // new client each time so we don't reuse the same connection in failure
 				resp, err := cl.Do(newreq)
 				if err != nil {
+					if err == context.Canceled || strings.Contains(err.Error(), "context canceled") {
+						// the client closed connection
+						ow.WriteHeader(http.StatusNoContent)
+						return
+					}
 					retries++
-					log.Debug(logger, "retryable status, will retry", "err", err, "method", req.Method, "path", req.URL.Path, "retries", retries, "delayed", time.Since(started), "user-agent", req.Header.Get("user-agent"))
+					log.Debug(logger, "retryable error, will retry", "err", err, "method", req.Method, "path", req.URL.Path, "retries", retries, "delayed", time.Since(started), "user-agent", req.Header.Get("user-agent"))
 					time.Sleep(time.Duration(retries) * time.Millisecond * time.Duration(10))
 					continue
 				}
@@ -100,12 +103,16 @@ var rootCmd = &cobra.Command{
 					time.Sleep(time.Duration(retries) * time.Millisecond * time.Duration(10))
 					continue
 				}
+				// must write the headers *before* the status and body
 				for k, v := range resp.Header {
-					req.Header.Set(k, v[0])
+					for _, h := range v {
+						ow.Header().Add(k, h)
+					}
 				}
+				ow.WriteHeader(resp.StatusCode)
 				tx, _ = io.Copy(ow, resp.Body)
 				resp.Body.Close()
-				log.Debug(logger, "routed", "path", req.URL.Path, "method", req.Method, "duration", time.Since(started), "tx", tx, "rx", rx, "user-agent", req.Header.Get("user-agent"))
+				log.Debug(logger, "routed", "path", req.URL.Path, "method", req.Method, "duration", time.Since(started), "tx", tx, "rx", rx, "user-agent", req.Header.Get("user-agent"), "status", resp.StatusCode)
 				return
 			}
 			// if we get here, we timed out
