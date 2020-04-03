@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,19 +19,45 @@ import (
 
 const maxAttempts = time.Second * 10
 
+var skipHeaders = map[string]bool{
+	"Content-Length": true,
+}
+
+func newClient() *http.Client {
+	client := &http.Client{}
+	client.Transport = &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			DualStack: true,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    true, // disable so we can stream byte-for-byte
+	}
+	return client
+}
+
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use: "retry-proxy",
 	Run: func(cmd *cobra.Command, args []string) {
-		logger := log.NewCommandLogger(cmd)
-		defer logger.Close()
+		l := log.NewCommandLogger(cmd)
+		defer l.Close()
+		logger := log.With(l, "pkg", "proxy")
 
+		// validate our upstream
 		upstream, _ := cmd.Flags().GetString("upstream")
-		_, err := url.Parse(upstream)
-
-		if err != nil {
+		if _, err := url.Parse(upstream); err != nil {
 			log.Fatal(logger, "error parsing upstream url", "err", err, "url", upstream)
 		}
+
+		// useful for ping-pong between server to test
+		echo, _ := cmd.Flags().GetBool("echo")
 
 		redirect := http.HandlerFunc(func(ow http.ResponseWriter, req *http.Request) {
 			started := time.Now()
@@ -39,29 +66,37 @@ var rootCmd = &cobra.Command{
 				ow.WriteHeader(http.StatusBadRequest)
 				return
 			}
+			if echo {
+				ow.WriteHeader(http.StatusOK)
+				io.Copy(ow, bytes.NewReader(body))
+				return
+			}
 			u, _ := url.Parse(upstream)
 			u.Path = req.URL.Path
 			var tx int64
 			rx := len(body)
 			var retries int
 			for time.Since(started) < maxAttempts {
-				req, _ := http.NewRequestWithContext(req.Context(), req.Method, u.String(), bytes.NewReader(body))
+				newreq, _ := http.NewRequestWithContext(req.Context(), req.Method, u.String(), bytes.NewReader(body))
 				for k, v := range req.Header {
-					req.Header.Set(k, v[0])
+					if !skipHeaders[k] {
+						newreq.Header.Set(k, v[0])
+					}
 				}
-				resp, err := http.DefaultClient.Do(req)
+				cl := newClient() // new client each time so we don't reuse the same connection in failure
+				resp, err := cl.Do(newreq)
 				if err != nil {
 					retries++
-					log.Debug(logger, "retryable status, will retry", "err", err, "method", req.Method, "path", req.URL.Path, "retries", retries, "delayed", time.Since(started))
+					log.Debug(logger, "retryable status, will retry", "err", err, "method", req.Method, "path", req.URL.Path, "retries", retries, "delayed", time.Since(started), "user-agent", req.Header.Get("user-agent"))
 					time.Sleep(time.Duration(retries) * time.Millisecond * time.Duration(10))
 					continue
 				}
 				switch resp.StatusCode {
-				case 429, 499, 502, 503, 504:
+				case 408, 429, 502, 503, 504:
 					io.Copy(ioutil.Discard, resp.Body)
 					resp.Body.Close()
 					retries++
-					log.Debug(logger, "retryable status, will retry", "status", resp.StatusCode, "method", req.Method, "path", req.URL.Path, "retries", retries, "delayed", time.Since(started))
+					log.Debug(logger, "retryable status, will retry", "status", resp.StatusCode, "method", req.Method, "path", req.URL.Path, "retries", retries, "delayed", time.Since(started), "user-agent", req.Header.Get("user-agent"))
 					time.Sleep(time.Duration(retries) * time.Millisecond * time.Duration(10))
 					continue
 				}
@@ -70,7 +105,7 @@ var rootCmd = &cobra.Command{
 				}
 				tx, _ = io.Copy(ow, resp.Body)
 				resp.Body.Close()
-				log.Debug(logger, "routed", "path", req.URL.Path, "method", req.Method, "duration", time.Since(started), "tx", tx, "rx", rx)
+				log.Debug(logger, "routed", "path", req.URL.Path, "method", req.Method, "duration", time.Since(started), "tx", tx, "rx", rx, "user-agent", req.Header.Get("user-agent"))
 				return
 			}
 			// if we get here, we timed out
@@ -111,4 +146,6 @@ func init() {
 	log.RegisterFlags(rootCmd)
 	rootCmd.Flags().Int("port", pos.GetenvInt("PORT", 8080), "port to listen")
 	rootCmd.Flags().String("upstream", pos.Getenv("UPSTREAM", "http://127.0.0.1:8081"), "upstream server")
+	rootCmd.Flags().Bool("echo", false, "if we should just echo back")
+	rootCmd.Flags().MarkHidden("echo")
 }
