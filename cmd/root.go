@@ -75,8 +75,10 @@ var rootCmd = &cobra.Command{
 			var tx int64
 			rx := len(body)
 			var retries int
+			ctx, cancel := context.WithTimeout(req.Context(), maxRetryDuration)
+			defer cancel()
 			for time.Since(started) < maxRetryDuration {
-				newreq, _ := http.NewRequestWithContext(req.Context(), req.Method, u.String(), bytes.NewReader(body))
+				newreq, _ := http.NewRequestWithContext(ctx, req.Method, u.String(), bytes.NewReader(body))
 				for k, v := range req.Header {
 					newreq.Header.Set(k, v[0])
 				}
@@ -87,6 +89,11 @@ var rootCmd = &cobra.Command{
 					if err == context.Canceled || strings.Contains(err.Error(), "context canceled") {
 						// the client closed connection
 						ow.WriteHeader(http.StatusNoContent)
+						return
+					}
+					if err == context.DeadlineExceeded || strings.Contains(err.Error(), "deadline exceeded") {
+						// timed out
+						ow.WriteHeader(http.StatusGatewayTimeout)
 						return
 					}
 					retries++
