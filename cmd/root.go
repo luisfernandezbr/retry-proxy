@@ -19,7 +19,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const maxRetryDuration = time.Second * 10
+const (
+	maxRetryAttempts   = 3
+	maxRequestDuration = time.Minute
+)
 
 func newClient() *http.Client {
 	client := &http.Client{}
@@ -75,9 +78,9 @@ var rootCmd = &cobra.Command{
 			var tx int64
 			rx := len(body)
 			var retries int
-			ctx, cancel := context.WithTimeout(req.Context(), maxRetryDuration)
+			ctx, cancel := context.WithTimeout(req.Context(), maxRequestDuration)
 			defer cancel()
-			for time.Since(started) < maxRetryDuration {
+			for i := 0; i < maxRetryAttempts; i++ {
 				newreq, _ := http.NewRequestWithContext(ctx, req.Method, u.String(), bytes.NewReader(body))
 				for k, v := range req.Header {
 					newreq.Header.Set(k, v[0])
@@ -86,6 +89,11 @@ var rootCmd = &cobra.Command{
 				cl := newClient() // new client each time so we don't reuse the same connection in failure
 				resp, err := cl.Do(newreq)
 				if err != nil {
+					if time.Since(started) >= maxRequestDuration {
+						// since request has exceeded our max request timeout
+						ow.WriteHeader(http.StatusGatewayTimeout)
+						return
+					}
 					if err == context.Canceled || strings.Contains(err.Error(), "context canceled") {
 						// the client closed connection
 						ow.WriteHeader(http.StatusNoContent)
