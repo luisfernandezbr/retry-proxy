@@ -22,7 +22,7 @@ import (
 
 const (
 	maxRetryAttempts   = 3
-	maxRequestDuration = time.Minute
+	maxRequestDuration = time.Minute * 3
 )
 
 func newClient() *http.Client {
@@ -87,8 +87,6 @@ var rootCmd = &cobra.Command{
 			u.Path = req.URL.Path
 			var tx int64
 			rx := len(body)
-			ctx, cancel := context.WithTimeout(req.Context(), maxRequestDuration)
-			defer cancel()
 			for i := 1; i <= maxRetryAttempts; i++ {
 				// round robin our pools so we always get a different backend
 				mu.Lock()
@@ -96,6 +94,8 @@ var rootCmd = &cobra.Command{
 				offset := requests % maxRetryAttempts
 				cl := pooledConnections[offset]
 				mu.Unlock()
+				ctx, cancel := context.WithTimeout(req.Context(), maxRequestDuration)
+				defer cancel()
 				newreq, _ := http.NewRequestWithContext(ctx, req.Method, u.String(), bytes.NewReader(body))
 				for k, v := range req.Header {
 					newreq.Header.Set(k, v[0])
